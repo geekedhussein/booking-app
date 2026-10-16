@@ -1,0 +1,152 @@
+# =============================================================================
+# docker-compose.yml  (Phase 1 → Part XI: local orchestration)
+#
+# Brings up the ENTIRE system with one command: `docker compose up --build`.
+# Services: mongo, redis, a one-shot migrate job, the API, the worker, the outbox
+# relay, the scheduler and the web frontend. The dependency ordering below is the
+# important part — services wait for their dependencies to be HEALTHY (not merely
+# started) before launching, so the app never boots against a database that
+# isn't ready yet.
+#
+# NOTE: the same image (built once) runs app, worker, and migrate — only the
+# `command` differs. That's the "one artifact, many roles" idea from the
+# Dockerfile.
+# =============================================================================
+
+services:
+  # MongoDB as a single-node REPLICA SET. Multi-document transactions (which the
+  # booking capacity check relies on) only exist on a replica set, so even one
+  # node must run as one. The health check initiates the set on first start and
+  # only reports healthy once this node is the writable primary.
+  mongo:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - "try { rs.status() } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }) } quit(db.hello().isWritablePrimary ? 0 : 1)"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot migration job: runs to completion, then exits. The other services
+  # wait for it to SUCCEED before starting (condition: service_completed_...),
+  # so validators and indexes always exist before any code writes data.
+  migrate:
+    build: .
+    command: ["node", "src/db/migrate.js"]
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/booking?directConnection=true
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string-min16}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build: .
+    command: ["node", "src/server.js"]
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      MONGODB_URI: mongodb://mongo:27017/booking?directConnection=true
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string-min16}
+      LOG_LEVEL: info
+      APP_BASE_URL: http://localhost:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["node", "src/worker.js"]
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/booking?directConnection=true
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string-min16}
+      LOG_LEVEL: info
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # V2.3: reads the outbox and delivers events to the queue + pub/sub.
+  relay:
+    build: .
+    command: ["node", "src/outbox-relay.js"]
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/booking?directConnection=true
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string-min16}
+      LOG_LEVEL: info
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # V2.9: time-triggered jobs (reminders + retention cleanup).
+  scheduler:
+    build: .
+    command: ["node", "src/scheduler.js"]
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/booking?directConnection=true
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string-min16}
+      LOG_LEVEL: info
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # The React frontend (../booking-web), served by nginx with /v1 and /ws
+  # proxied to the API. Open http://localhost:8080.
+  web:
+    build: ../booking-web
+    ports:
+      - "8080:80"
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  mongodata:
